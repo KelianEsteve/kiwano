@@ -512,3 +512,187 @@ class CMVN(Augmentation):
         if self.norm_means == True:
             tensor = tensor - tensor.mean(dim=0)
         return tensor
+
+###############################################
+#                                             #
+#          DATA AUGMENTATION FOR EEG          # 
+#                                             #
+###############################################
+
+
+class Cropping():
+    """
+    Crops the EEG signal into smaller overlapping windows of specified length and overlap.
+
+    Source : Inspired by the description in : https://doi.org/10.1016/j.heliyon.2022.e10240 3.2.5. Cropping (CPS)
+    """
+    def __init__(self, wlen: float = 0.5, n_overlap: float = 0.5):
+        self.wlen = wlen
+        self.n_overlap = n_overlap
+
+    def __call__(self, tensor: torch.Tensor, sample_rate: int):
+        n_channels, n_samples = tensor.shape
+        crop_size = int(self.wlen * sample_rate)
+        step_size = int(crop_size * (1 - self.n_overlap))
+
+        n_crops = max(1, (n_samples - crop_size) // step_size + 1)
+
+        crops = []
+        for i in range(n_crops):
+            start = i * step_size
+            end = start + crop_size
+            if end <= n_samples:
+                crop = tensor[:, start:end]
+                crops.append(crop)
+
+        crops_tensor = torch.stack(crops)
+        return crops_tensor
+    
+
+class GaussianNoiseAddition():
+    """
+    Adds Gaussian noise to the EEG signal with variance proportional to the channel's mean.
+
+    Source : Inspired by the description in : https://doi.org/10.1016/j.heliyon.2022.e10240
+    """
+    def __init__(self):
+        pass
+
+    def __call__(self, tensor: torch.Tensor):
+        mean_per_channel = tensor.mean(dim=1, keepdim=True)
+
+        noise = torch.randn_like(tensor) * mean_per_channel
+
+        tensor_with_noise = tensor + noise
+
+        return tensor_with_noise
+    
+class CutCat():
+    """
+    This function combines segments (with equal length in time) of the time series contained in the batch.
+    Proposed for EEG signals in https://doi.org/10.1016/j.neunet.2021.05.032.
+
+    Arguments
+    ---------
+    min_num_segments : int
+        The minimum number of segments to combine.
+    max_num_segments : int
+        The maximum number of segments to combine.
+
+    Example
+    -------
+    >>> signal = torch.ones((4, 256, 22)) * torch.arange(4).reshape((4, 1, 1))
+    >>> cutcat = CutCat()
+    >>> output_signal = cutcat(signal)
+
+    Source : https://speechbrain.readthedocs.io/en/stable/_modules/speechbrain/augment/time_domain.html#CutCat.forward
+    Note : this technique is used in the speechbrain recipe for EEGNet
+
+    """
+
+    def __init__(self, min_num_segments=2, max_num_segments=10):
+        self.min_num_segments = min_num_segments
+        self.max_num_segments = max_num_segments
+
+        # Ensure max_num_segments is greater than or equal to min_num_segments
+        if self.max_num_segments < self.min_num_segments:
+            raise ValueError("max_num_segments must be >= min_num_segments")
+
+    def __call__(self, waveforms: torch.Tensor):
+        """
+        Arguments
+        ---------
+        waveforms : torch.Tensor
+            Shape should be `[batch, time]` or `[batch, time, channels]`.
+
+        Returns
+        -------
+        Tensor of shape `[batch, time]` or `[batch, time, channels]`
+        """
+        if waveforms.shape[0] > 1:  # Only if there are at least 2 examples in the batch
+            # Rolling waveforms to use segments from other examples in the batch
+            waveforms_rolled = torch.roll(waveforms, shifts=1, dims=0)
+
+            # Determine the number of segments to use
+            num_segments = torch.randint(
+                low=self.min_num_segments,
+                high=self.max_num_segments + 1,
+                size=(1,)
+            ).item()
+
+            # Compute indices for the start and stop of each segment
+            idx_cut = torch.linspace(
+                0, waveforms.shape[1], num_segments + 1, dtype=torch.int
+            )
+
+            # Replace segments with rolled segments alternately
+            for i in range(len(idx_cut) - 1):
+                if i % 2 == 1:  # Replace alternate segments
+                    start = idx_cut[i]
+                    stop = idx_cut[i + 1]
+                    waveforms[:, start:stop, ...] = waveforms_rolled[:, start:stop, ...]
+
+        return waveforms
+
+
+class RandAmp():
+    """This function multiples the signal by a random amplitude. First, the
+    signal is normalized to have amplitude between -1 and 1. Then it is
+    multiplied with a random number.
+
+    Arguments
+    ---------
+    amp_low : float
+        The minimum amplitude multiplication factor.
+    amp_high : float
+        The maximum amplitude multiplication factor.
+
+    Example
+    -------
+    >>> from speechbrain.dataio.dataio import read_audio
+    >>> rand_amp = RandAmp(amp_low=0.25, amp_high=1.75)
+    >>> signal = read_audio('tests/samples/single-mic/example1.wav')
+    >>> output_signal = rand_amp(signal.unsqueeze(0))
+
+    Source : https://speechbrain.readthedocs.io/en/stable/_modules/speechbrain/augment/time_domain.html#RandAmp
+    Note : this technique is used in the speechbrain recipe for EEGNet
+
+    """
+
+    def __init__(self, amp_low=0.5, amp_high=1.5):
+        super().__init__()
+        self.amp_low = amp_low
+        self.amp_high = amp_high
+
+
+    def __call__(self, waveforms):
+        """
+        Arguments
+        ---------
+        waveforms : torch.Tensor
+            Shape should be `[batch, time]` or `[batch, time, channels]`.
+
+        Returns
+        -------
+        Tensor of shape `[batch, time]` or `[batch, time, channels]`
+        """
+
+        # Normalize the signal
+        abs_max, _ = torch.max(torch.abs(waveforms), dim=1, keepdim=True)
+        waveforms = waveforms / abs_max
+
+        # Pick a frequency to drop
+        rand_range = self.amp_high - self.amp_low
+        amp = (
+            torch.rand(waveforms.shape[0], device=waveforms.device) * rand_range
+            + self.amp_low
+        )
+        amp = amp.unsqueeze(1)
+        if len(waveforms.shape) == 3:
+            amp = amp.unsqueeze(2)
+        waveforms = waveforms * amp
+
+        return waveforms
+    
+
+
