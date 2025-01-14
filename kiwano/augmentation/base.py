@@ -693,6 +693,88 @@ class RandAmp():
         waveforms = waveforms * amp
 
         return waveforms
-    
 
+class FTSurrogate():
+    """
+    Fourier Transform surrogate augmentation for EEG signals.
+
+    Paper : https://doi.org/10.1088/1741-2552/aca220
+    Souce : https://github.com/braindecode/braindecode//blob/master/braindecode/augmentation/transforms.py#L78-L151
+
+    Parameters
+    ----------
+    phase_noise_magnitude : float, optional
+        Float between 0 and 1 defining the range of phase perturbation.
+        Phase noise is sampled uniformly from [0, phase_noise_magnitude * 2 * pi].
+        Defaults to 1.
+    channel_indep : bool, optional
+        If True, phase perturbations are sampled independently for each channel.
+        Defaults to False.
+    probability : float, optional
+        Probability of applying the transformation. Defaults to 1.0.
+
+    References
+    ----------
+    Schwabedal, J. T., Snyder, J. C., Cakmak, A., Nemati, S., &
+    Clifford, G. D. (2018). Addressing Class Imbalance in Classification
+    Problems of Noisy Signals by using Fourier Transform Surrogates.
+    arXiv preprint arXiv:1806.08675.
+    """
+
+    def __init__(self, phase_noise_magnitude=1.0, channel_indep=False, probability=1.0):
+        assert 0 <= phase_noise_magnitude <= 1, "phase_noise_magnitude must be in [0, 1]"
+        assert 0 <= probability <= 1, "probability must be in [0, 1]"
+        assert isinstance(channel_indep, bool), "channel_indep must be a boolean"
+
+        self.phase_noise_magnitude = phase_noise_magnitude
+        self.channel_indep = channel_indep
+        self.probability = probability
+
+    def __call__(self, tensor: torch.Tensor):
+        """
+        Apply the transformation.
+
+        Parameters
+        ----------
+        tensor : torch.Tensor
+            Input tensor of shape [channels, samples] or [batch, channels, samples].
+
+        Returns
+        -------
+        torch.Tensor
+            Augmented tensor of the same shape as the input.
+        """
+        if torch.rand(1).item() > self.probability:
+            return tensor  # No transformation applied
+
+        if tensor.ndim == 2:  # Single sample [channels, samples]
+            return self._augment_single(tensor)
+        elif tensor.ndim == 3:  # Batch of samples [batch, channels, samples]
+            return torch.stack([self._augment_single(sample) for sample in tensor])
+        else:
+            raise ValueError("Input tensor must have 2 or 3 dimensions.")
+
+    def _augment_single(self, tensor: torch.Tensor):
+        # Perform FFT
+        fft = torch.fft.rfft(tensor, dim=-1)
+        magnitude = torch.abs(fft)
+        phase = torch.angle(fft)
+
+        # Generate phase noise
+        noise_range = self.phase_noise_magnitude * 2 * np.pi
+        if self.channel_indep:
+            noise = (torch.rand_like(phase) - 0.5) * noise_range
+        else:
+            noise = (torch.rand(1, phase.shape[-1], device=tensor.device) - 0.5) * noise_range
+
+        # Apply phase perturbation
+        new_phase = phase + noise
+
+        # Reconstruct the FFT with modified phase
+        augmented_fft = magnitude * torch.exp(1j * new_phase)
+
+        # Perform inverse FFT to return to the time domain
+        augmented_signal = torch.fft.irfft(augmented_fft, n=tensor.shape[-1], dim=-1)
+
+        return augmented_signal
 
