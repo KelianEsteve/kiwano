@@ -6,6 +6,8 @@ import hashlib
 import zipfile
 import tarfile
 import os
+import mne
+import torch
 import concurrent.futures
 
 Pathlike = Union[Path, str]
@@ -232,3 +234,29 @@ def check_md5(dir, liste):
                 os.remove(fname)
             else:
                 print("File ", fname," finally correctly downloaded")
+
+
+def open_edf(file, sensors=None, target_freq=None):
+    try:
+        raw = mne.io.read_raw_edf(file, preload=True)
+
+        if sensors:
+            available_sensors = raw.ch_names
+            missing_sensors = [sensor for sensor in sensors if sensor not in available_sensors]
+            if missing_sensors:
+                raise ValueError(f"Missing sensors in the EDF data: {missing_sensors}")
+
+            raw.pick_channels(sensors)
+
+        if target_freq and target_freq != raw.info['sfreq']:
+            raw.resample(target_freq, npad="auto")
+
+        data = raw.get_data()
+
+        data_tensor = torch.tensor(data, dtype=torch.float32)
+
+        print(f"Data shape after resampling: {data_tensor.shape}")
+        return data_tensor
+    except Exception as e:
+        print(f"Error opening the EDF file: {e}")
+        return None
